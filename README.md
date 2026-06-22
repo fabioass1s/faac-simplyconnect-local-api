@@ -14,7 +14,7 @@ SimplyConnect.
 ## Configurar
 
 ```bash
-cd faac-gate-api
+cd faac-simplyconnect-local-api
 python -m venv .venv && .venv\Scripts\activate      # Windows
 pip install -r requirements.txt
 
