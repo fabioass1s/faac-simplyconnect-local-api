@@ -16,6 +16,7 @@ Fluxo:
 from __future__ import annotations
 
 import hmac
+import time
 from typing import Callable, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
@@ -74,6 +75,15 @@ X-API-Key: <a chave do .env>
 > `POST /gates/{access_point_id}` — **abre** (padrão).
 > `POST /gates/{access_point_id}?command=stop` ou `?command=pedestrian`.
 > `POST /gates/{access_point_id}?code=N` — envia um `code` específico (veja o passo 6).
+> A resposta traz `state_before`/`state_after` (ex.: `Fechado` → `Abrindo`),
+> aguardando alguns segundos para confirmar a transição. Para respostas rápidas
+> use `?status_mode=predict` (deduz o resultado sem esperar) ou `?status_mode=off`
+> (só envia). Veja os modos no detalhe do endpoint.
+
+**8. Veja o estado físico do portão** (abrindo / fechando / aberto / fechado)
+> `GET /gates/{access_point_id}/status` — `state.code` = CLOSED | OPENING | OPEN |
+> CLOSING | UNKNOWN, `state.label` em português e `state.moving` (em movimento?).
+> Não confunda com o `status` de cadastro (not_registered/pending/ready).
 
 ---
 
@@ -219,6 +229,22 @@ def _send(access_point_id: str, code: int) -> dict:
                     rec["private_key"], rec["device_public_key"], code)
     res["gate"] = rec.get("name") or access_point_id
     return res
+
+
+def _poll_state(access_point_id: str, before_ls, timeout: float = 6.0,
+                interval: float = 1.0) -> dict:
+    """Lê o estado por alguns segundos até o logicalStatus mudar em relação a
+    `before_ls` (o portão leva ~3-4s para começar a se mover) e devolve esse
+    primeiro estado já diferente. Se nada mudar até o timeout, devolve a última
+    leitura."""
+    deadline = time.monotonic() + timeout
+    last = FAAC.call(faac.get_gate_status, access_point_id)
+    while time.monotonic() < deadline:
+        if last.get("logicalStatus") != before_ls:
+            return last
+        time.sleep(interval)
+        last = FAAC.call(faac.get_gate_status, access_point_id)
+    return last
 
 
 def _status(access_point_id: str, rec: Optional[dict]) -> str:
@@ -436,23 +462,81 @@ def gate_commands(access_point_id: str):
     return {"commands": FAAC.call(faac.list_commands, access_point_id)}
 
 
+@api.get("/gates/{access_point_id}/status", tags=["gates"])
+def gate_status(access_point_id: str):
+    """Estado FÍSICO atual do portão: abrindo / fechando / aberto / fechado.
+
+    Lê o `logicalStatus` do portão e traduz:
+    - `state.code`  : CLOSED | OPENING | OPEN | CLOSING | UNKNOWN
+    - `state.label` : rótulo em português
+    - `state.moving`: True se está em movimento (abrindo/fechando)
+
+    (Não confunda com o `status` de cadastro de GET /gates/{id}, que é
+    not_registered/pending/ready.)
+    """
+    ap = _find_gate(access_point_id)
+    st = FAAC.call(faac.get_gate_status, access_point_id)
+    return {"id": access_point_id, "name": ap["name"], **st}
+
+
 _COMMAND_CODES = {"open": 1, "pedestrian": 2, "stop": 3}
 
 
+_STATUS_MODES = ("confirm", "predict", "now", "off")
+
+
 @api.post("/gates/{access_point_id}", tags=["gates"])
-def gate_action(access_point_id: str, command: str = "open", code: Optional[int] = None):
+def gate_action(access_point_id: str, command: str = "open",
+                code: Optional[int] = None, status_mode: str = "confirm"):
     """Aciona o portão. Por padrão ABRE.
 
     - POST /gates/{id}                  -> abre
     - POST /gates/{id}?command=stop     -> para   (ou pedestrian)
     - POST /gates/{id}?code=13          -> envia um code específico
+
+    `status_mode` controla como o `state_after` é obtido:
+
+    - **`confirm`** (padrão): espera alguns segundos e lê o estado REAL da nuvem
+      (mais lento, ~6s, mas confirma a transição: Fechado → Abrindo).
+    - **`predict`**: *ultrarrápido*. Lê só o estado ATUAL e **deduz** o resultado
+      do comando (fechado+abrir → Abrindo; aberto+abrir → Fechando). Não confirma
+      na nuvem — `state_after.predicted = true`.
+    - **`now`**: lê o estado imediatamente após enviar (snapshot; como o portão
+      leva ~3-4s para se mexer, costuma ainda mostrar o estado anterior).
+    - **`off`**: não lê nada — só envia o comando (resposta mínima, sem `state_*`).
+
+    `state_before` vem em todos os modos, menos `off`.
     """
     if code is None:
         code = _COMMAND_CODES.get(command.lower())
         if code is None:
             raise HTTPException(422, f"command inválido: '{command}'. "
                                      "Use open/pedestrian/stop, ou ?code=N.")
-    return _send(access_point_id, code)
+    if status_mode not in _STATUS_MODES:
+        raise HTTPException(422, f"status_mode inválido: '{status_mode}'. "
+                                 f"Use um de: {', '.join(_STATUS_MODES)}.")
+
+    if status_mode == "off":
+        return _send(access_point_id, code)
+
+    before = FAAC.call(faac.get_gate_status, access_point_id)
+    res = _send(access_point_id, code)
+
+    if status_mode == "predict":
+        after_state = faac.predict_state(before["state"]["code"], code)
+        online = before.get("online")
+    else:  # confirm | now
+        after = (_poll_state(access_point_id, before.get("logicalStatus"))
+                 if status_mode == "confirm"
+                 else FAAC.call(faac.get_gate_status, access_point_id))
+        after_state = after["state"]
+        online = after.get("online")
+
+    res["state_before"] = before["state"]
+    res["state_after"] = after_state
+    res["label"] = after_state["label"]
+    res["online"] = online
+    return res
 
 
 app.include_router(api)

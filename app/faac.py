@@ -40,6 +40,50 @@ ICON_LABELS = {
     "PARTIAL_BIDIRECTIONAL": "Parcial bidirecional",
 }
 
+# Estado físico do portão, lido do campo inteiro `logicalStatus` da automação.
+# Mapa validado observando o portão real (notebook dev_status.ipynb):
+#   abrir : 0 -> 1 -> 2     fechar: 2 -> 5 -> 0
+# Tupla: (code técnico, rótulo PT, moving?). 3/4/6/7 não observados ainda.
+LOGICAL_STATUS = {
+    0: ("CLOSED",  "Fechado",  False),
+    1: ("OPENING", "Abrindo",  True),
+    2: ("OPEN",    "Aberto",   False),
+    5: ("CLOSING", "Fechando", True),
+}
+
+
+def decode_logical_status(value) -> dict:
+    """Traduz o inteiro `logicalStatus` em {raw, code, label, moving}.
+
+    Para valores ainda não mapeados devolve code UNKNOWN e moving=None
+    (não sabemos se está parado), sem quebrar."""
+    if value is None:
+        return {"raw": None, "code": "UNKNOWN", "label": "Desconhecido", "moving": None}
+    code, label, moving = LOGICAL_STATUS.get(
+        value, ("UNKNOWN", f"Estado {value} (desconhecido)", None))
+    return {"raw": value, "code": code, "label": label, "moving": moving}
+
+
+def predict_state(before_code: str, command_code: int) -> dict:
+    """Estima o estado resultante a partir do estado ATUAL + comando, SEM consultar
+    a nuvem de novo (modo ultrarrápido).
+
+    O portão é toggle: acionar quando fechado abre, quando aberto fecha. É só um
+    palpite — o resultado real depende da configuração do portão — por isso o
+    estado devolvido vem com `predicted: True`.
+    """
+    def _s(code, label, moving):
+        return {"raw": None, "code": code, "label": label,
+                "moving": moving, "predicted": True}
+
+    if command_code == 3:                       # parar
+        return _s("STOPPED", "Parado", False)
+    if before_code in ("CLOSED", "CLOSING"):    # mais fechado -> vai abrir
+        return _s("OPENING", "Abrindo", True)
+    if before_code in ("OPEN", "OPENING"):      # mais aberto -> vai fechar
+        return _s("CLOSING", "Fechando", True)
+    return _s("UNKNOWN", "Desconhecido", None)
+
 
 # --------------------------------------------------------------------------- #
 #  Helpers de parsing
@@ -201,6 +245,41 @@ def list_access_points(session: requests.Session) -> list[dict]:
             "public_key": ints_to_hex(pick(dev, "publicKey")),
         })
     return aps
+
+
+def get_gate_status(session: requests.Session, ap_id: str) -> dict:
+    """Estado físico atual do portão (abrindo/fechando/aberto/fechado/...).
+
+    Fonte: o mesmo /access-points/archived que list_access_points já usa — cada
+    item traz `logicalStatus` (int) + flags. Não custa chamada extra de rede
+    além deste GET. Devolve {logicalStatus, state, online, inError, inAlarm,
+    modfun, lastConnectionOn, found}."""
+    r = session.get(
+        f"{API_BASE}/simply-connect/access-points/archived",
+        params={"page": 1, "pageSize": 50,
+                "sortOnlineOfflineDateCreation": "true", "excludeArchived": "true"},
+    )
+    if r.status_code != 200:
+        raise FaacError(r.status_code, r.text[:300])
+    item = next((it for it in extract_items(r.json())
+                 if isinstance(it, dict) and pick(it, "id", "_id", "accessPointId") == ap_id),
+                None)
+    if item is None:
+        return {"found": False, "logicalStatus": None,
+                "state": decode_logical_status(None), "online": None,
+                "inError": None, "inAlarm": None, "modfun": None,
+                "lastConnectionOn": None}
+    ls = item.get("logicalStatus")
+    return {
+        "found": True,
+        "logicalStatus": ls,
+        "state": decode_logical_status(ls),
+        "online": item.get("online"),
+        "inError": item.get("inError"),
+        "inAlarm": item.get("inAlarm"),
+        "modfun": item.get("modfun"),
+        "lastConnectionOn": item.get("lastConnectionOn"),
+    }
 
 
 def get_ap_devices(session: requests.Session, ap_id: str) -> list[dict]:
